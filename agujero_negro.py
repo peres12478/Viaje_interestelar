@@ -1,25 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AGUJERO NEGRO — laboratorio de gravedad controlado con la mano
-==============================================================
+AGUJERO NEGRO — del desafío de gestos al tesseract de Interstellar
+==================================================================
 
-Un agujero negro en el centro atrae polvo, hielo y fragmentos dorados. Tu mano
-(vista por la cámara) es un segundo campo gravitatorio con el que puedes guiar
-las partículas hacia el horizonte de sucesos para sumar puntos.
+FASE 1 · PROTOCOLO DE ACCESO
+    Un agujero negro atrae polvo, hielo y fragmentos dorados. El sistema te pide
+    mostrar con los dedos un número (1 a 5) y mantenerlo ~1 s. Si completas 5
+    gestos correctos, el agujero abre un portal. Si se agota el tiempo (12 s) pierdes
+    un punto de sincronización. Mientras tanto la mano sigue siendo un campo
+    gravitatorio: palma abierta atrae partículas y puño las atrapa y lanza.
 
-Gestos:
-    MANO ABIERTA ... campo atractor: las partículas cercanas se sienten atraídas por tu palma
-    PUÑO CERRADO ... pinza gravitatoria: atrapa partículas cercanas y las lleva contigo;
-                     al abrir la mano las lanzas con la velocidad de tu mano
-    GESTO "L" ...... (pulgar e índice en ángulo recto, mantenido 2 s) cierra este programa
-                     y vuelve a abrir main.py (el Museo Espacial)
+FASE 2 · PORTAL
+    Cruzas el horizonte de sucesos (efecto de caída y destello).
 
-Puntuación:
-    polvo 10 · hielo 25 · fragmento dorado 100, multiplicado por el combo (hasta x5)
-    y por x2 si la partícula fue atrapada y lanzada por ti ("tiro certero").
+FASE 3 · TESSERACT
+    Una simulación de la "biblioteca del tiempo": un hipercubo 4D girando dentro de
+    un túnel de líneas temporales. Mueve la mano de izquierda a derecha para viajar
+    por el tiempo; cuando un recuerdo (esfera luminosa) se alinee contigo, cierra el
+    puño para sellarlo. Con 5 recuerdos el mensaje llega a su destino.
 
-Teclado (opcional):  Q / ESC salir · H esqueleto de la mano · L simular gesto L · C quitar simulación
+Gestos de números (con el pulgar recogido salvo en el 5):
+    1 = índice · 2 = índice+corazón · 3 = índice+corazón+anular · 4 = cuatro dedos · 5 = mano abierta
+GESTO "L" (pulgar e índice en ángulo recto, mantenido 2 s): cierra este programa y
+vuelve a abrir main.py (el Museo Espacial) en cualquier fase.
+
+Teclado (opcional, para probar sin cámara):
+    1-5 simular número · F puño · O mano abierta · L gesto L · C quitar simulación
+    R reiniciar la secuencia · H esqueleto de la mano · Q / ESC salir
 
 Estructura esperada (la misma carpeta que main.py):
     museo_espacial/
@@ -30,6 +38,7 @@ Estructura esperada (la misma carpeta que main.py):
 
 from __future__ import annotations
 
+import itertools
 import math
 import subprocess
 import sys
@@ -37,6 +46,7 @@ import time
 import urllib.request
 from collections import Counter, deque
 from dataclasses import dataclass
+from enum import Enum, auto
 from pathlib import Path
 from typing import Optional
 
@@ -95,6 +105,14 @@ GRAB_RADIUS = 120.0        # radio de captura de la pinza (puño)
 MAX_HELD = 24              # partículas máximas sujetas a la vez
 THROW_GAIN = 1.1           # factor de velocidad al lanzar
 
+# --- Desafío de gestos y tesseract ---
+CHALLENGE_TOTAL = 5        # gestos correctos necesarios para abrir el portal
+CHALLENGE_TIME = 12.0      # segundos disponibles por gesto
+CHALLENGE_HOLD = 0.9       # segundos que hay que mantener el número correcto
+T_PORTAL = 4.2             # duración de la caída por el horizonte de sucesos
+MEMORIES = 5               # recuerdos que hay que sellar en el tesseract
+TESS_SCALE = 120.0         # tamaño en pantalla del hipercubo
+
 COMBO_WINDOW = 2.0         # segundos para encadenar combos
 KIND_VALUE = {0: 10, 1: 25, 2: 100}
 
@@ -117,6 +135,11 @@ def clamp(x: float, a: float = 0.0, b: float = 1.0) -> float:
 
 def lerp(a, b, t):
     return a + (b - a) * t
+
+
+def smoothstep(e0: float, e1: float, x: float) -> float:
+    t = clamp((x - e0) / (e1 - e0))
+    return t * t * (3 - 2 * t)
 
 
 # ----------------------------------------------------------------------------
@@ -285,8 +308,11 @@ class GestureDetector:
         self._landmarker = vision.HandLandmarker.create_from_options(options)
         self._last_ts = 0
         self.history = deque(maxlen=7)
+        self.num_history = deque(maxlen=7)
         self.stable: Optional[str] = None
         self.raw: Optional[str] = None
+        self.stable_number: Optional[int] = None         # 1..5 estable (dedos mostrados)
+        self.number_raw: Optional[int] = None
         self.landmarks: Optional[np.ndarray] = None      # (21, 2) en píxeles de pantalla (W x H)
 
     def process(self, frame_bgr: np.ndarray) -> None:
@@ -299,8 +325,9 @@ class GestureDetector:
         if result.hand_landmarks:
             pts = np.array([(p.x * W, p.y * H) for p in result.hand_landmarks[0]], np.float32)
             self.landmarks, self.raw = pts, self.classify(pts)
+            self.number_raw = self.classify_number(pts)
         else:
-            self.landmarks, self.raw = None, None
+            self.landmarks, self.raw, self.number_raw = None, None, None
 
         self.history.append(self.raw)
         for gesture, n in Counter(g for g in self.history if g).items():
@@ -308,6 +335,15 @@ class GestureDetector:
                 self.stable = gesture
         if not any(self.history):
             self.stable = None
+
+        self.num_history.append(self.number_raw)
+        votes = Counter(n for n in self.num_history if n)
+        if votes:
+            best, n_best = votes.most_common(1)[0]
+            if n_best >= 5:
+                self.stable_number = best
+        if self.stable_number is not None and votes.get(self.stable_number, 0) < 3:
+            self.stable_number = None                    # el número dejó de verse
 
     @classmethod
     def classify(cls, pts: np.ndarray) -> Optional[str]:
@@ -331,6 +367,32 @@ class GestureDetector:
 
         if sum(ext) <= 1:
             return GESTURE_FIST
+        return None
+
+    @classmethod
+    def classify_number(cls, pts: np.ndarray) -> Optional[int]:
+        """
+        Cuenta los dedos mostrados (1 a 5) como se hace al contar con la mano:
+        1 índice · 2 índice+corazón · 3 +anular · 4 cuatro dedos con el pulgar recogido ·
+        5 mano abierta con el pulgar fuera. Con el pulgar fuera y solo el índice sería
+        una "L", así que eso no cuenta como número.
+        """
+        def dist(a, b):
+            return float(np.linalg.norm(pts[a] - pts[b]))
+
+        palm = dist(0, 9) + 1e-6
+        ext = [dist(0, tip) > dist(0, pip) * 1.18 and dist(0, tip) > palm * 1.3 for tip, pip in cls.FINGERS]
+        thumb_out = dist(4, 9) > palm * 0.85 and dist(4, 5) > palm * 0.55
+        if all(ext):
+            return 5 if thumb_out else 4
+        if thumb_out:
+            return None
+        if ext == [True, False, False, False]:
+            return 1
+        if ext == [True, True, False, False]:
+            return 2
+        if ext == [True, True, True, False]:
+            return 3
         return None
 
     def close(self) -> None:
@@ -522,8 +584,9 @@ class HUD:
             self.typo.draw(frame, warning, x + w // 2, y - 28, 15, AMBER, bold=True, mono=True, align="center")
 
     def keys_help(self, frame):
-        self.typo.draw(frame, "GESTO L (2 s): VOLVER AL MUSEO", W - 28, H - 46, 12, AMBER, mono=True, align="right")
-        self.typo.draw(frame, "Q salir · H mano · L/C teclado", W - 28, H - 24, 12, TEXT_DIM, mono=True, align="right")
+        self.typo.draw(frame, "GESTO L (2 s): MUSEO ESPACIAL", W - 28, H - 46, 12, AMBER, mono=True, align="right")
+        self.typo.draw(frame, "Q salir · H mano · R reiniciar · 1-5/F/L/C teclado", W - 28, H - 24, 12, TEXT_DIM,
+                       mono=True, align="right")
 
     def l_progress(self, frame, progress: float, destination: str):
         w, h = 540, 56
@@ -536,6 +599,96 @@ class HUD:
         fill = int((bw - 2) * clamp(progress))
         if fill > 0:
             cv2.rectangle(frame, (bx + 1, by + 1), (bx + 1 + fill, by + bh - 1), AMBER, -1)
+
+    # ---- Fase 1: protocolo de acceso ----
+    def challenge_panel(self, frame, ch, accent=CYAN):
+        x, y, w, h = W - 390, 150, 360, 372
+        self.panel(frame, x, y, w, h, accent, alpha=0.68)
+        T = self.typo
+        T.draw(frame, "PROTOCOLO DE ACCESO", x + 18, y + 14, 15, accent, bold=True, mono=True)
+        cv2.line(frame, (x + 18, y + 38), (x + w - 18, y + 38), tuple(int(c * 0.4) for c in accent), 1)
+
+        seg_w = (w - 36 - 4 * 8) // CHALLENGE_TOTAL
+        for i in range(CHALLENGE_TOTAL):
+            sx = x + 18 + i * (seg_w + 8)
+            if i < ch.progress:
+                cv2.rectangle(frame, (sx, y + 50), (sx + seg_w, y + 64), GREEN, -1)
+            else:
+                cv2.rectangle(frame, (sx, y + 50), (sx + seg_w, y + 64), (120, 110, 100), 1)
+        T.draw(frame, f"SINCRONIZACIÓN {ch.progress}/{CHALLENGE_TOTAL}", x + w // 2, y + 70, 13, TEXT_DIM,
+               mono=True, align="center")
+
+        ncx, ncy = x + w // 2, y + 172                              # número grande + anillo de retención
+        cv2.circle(frame, (ncx, ncy), 78, (100, 90, 70), 2, cv2.LINE_AA)
+        hold = clamp(ch.hold / CHALLENGE_HOLD)
+        if hold > 0.01:
+            cv2.ellipse(frame, (ncx, ncy), (78, 78), 0, -90, -90 + 360 * hold, GREEN, 6, cv2.LINE_AA)
+        T.draw(frame, str(ch.target), ncx, ncy - 66, 110, WHITE, bold=True, align="center")
+
+        T.draw(frame, f"MUESTRA {ch.target} DEDO" + ("" if ch.target == 1 else "S"), ncx, y + 266, 18, accent,
+               bold=True, mono=True, align="center")
+        for i in range(5):                                           # fila de dedos
+            cx = ncx - 48 + i * 24
+            if i < ch.target:
+                cv2.circle(frame, (cx, y + 304), 7, accent, -1, cv2.LINE_AA)
+            else:
+                cv2.circle(frame, (cx, y + 304), 7, (120, 110, 100), 1, cv2.LINE_AA)
+
+        bx, by, bw, bh = x + 18, y + 326, w - 36, 8                  # tiempo restante
+        frac = clamp(ch.time_left / CHALLENGE_TIME)
+        cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), (120, 110, 100), 1)
+        if frac > 0:
+            cv2.rectangle(frame, (bx + 1, by + 1), (bx + 1 + int((bw - 2) * frac), by + bh - 1),
+                          AMBER if frac > 0.25 else RED, -1)
+        if ch.message_t > 0:
+            ok = ch.message == "SINCRONIZADO"
+            T.draw(frame, ch.message, ncx, y + 342, 15, GREEN if ok else RED, bold=True, mono=True,
+                   align="center", opacity=clamp(ch.message_t / 0.5))
+
+    # ---- Fase 3: tesseract ----
+    def timeline(self, frame, tau, mem_tau, collected, aligned_idx, accent=AMBER):
+        x, y, w, h = 360, H - 152, 700, 60
+        self.panel(frame, x, y, w, h, accent, alpha=0.62)
+        T = self.typo
+        T.draw(frame, "LÍNEA TEMPORAL", x + 18, y + 6, 12, TEXT_DIM, mono=True)
+        x0, x1, yy = x + 30, x + w - 30, y + 38
+        cv2.line(frame, (x0, yy), (x1, yy), (130, 120, 110), 1)
+        for k in range(11):
+            tx = x0 + int((x1 - x0) * k / 10)
+            cv2.line(frame, (tx, yy - 3), (tx, yy + 3), (130, 120, 110), 1)
+        for i, tm in enumerate(mem_tau):                             # recuerdos: rombos
+            mx = x0 + int((x1 - x0) * float(tm))
+            pts = np.array([[mx, yy - 9], [mx + 8, yy], [mx, yy + 9], [mx - 8, yy]], np.int32)
+            if collected[i]:
+                cv2.fillPoly(frame, [pts], GREEN)
+            elif i == aligned_idx:
+                cv2.fillPoly(frame, [pts], WHITE)
+            else:
+                cv2.polylines(frame, [pts], True, accent, 2, cv2.LINE_AA)
+        cx = x0 + int((x1 - x0) * tau)                               # cursor
+        cv2.fillPoly(frame, [np.array([[cx - 7, yy - 24], [cx + 7, yy - 24], [cx, yy - 10]], np.int32)], CYAN)
+        T.draw(frame, f"{tau * 100:5.1f} %", x + w - 18, y + 6, 12, CYAN, bold=True, mono=True, align="right")
+
+    def tess_stats(self, frame, tau, n_done, rot_deg, gesture_label, gesture_color, fps):
+        x, y, w, h = 20, H - 196, 340, 176
+        self.panel(frame, x, y, w, h, AMBER)
+        T = self.typo
+        T.draw(frame, "SIMULACIÓN · TESSERACT", x + 16, y + 12, 14, AMBER, bold=True, mono=True)
+        cv2.line(frame, (x + 16, y + 34), (x + w - 16, y + 34), tuple(int(c * 0.4) for c in AMBER), 1)
+        rows = [("INSTANTE", f"{tau * 100:5.1f} %", TEXT), ("RECUERDOS", f"{n_done}/{MEMORIES}", GREEN if n_done else TEXT),
+                ("ROTACIÓN 4D", f"{rot_deg:5.0f}°", TEXT), ("GESTO", gesture_label, gesture_color)]
+        for i, (label, value, color) in enumerate(rows):
+            yy = y + 44 + i * 24
+            T.draw(frame, label, x + 16, yy, 14, TEXT_DIM, mono=True)
+            T.draw(frame, value, x + w - 16, yy, 14, color, bold=True, mono=True, align="right")
+        T.draw(frame, f"{fps:4.0f} FPS", x + w - 16, y + h - 24, 12, TEXT_DIM, mono=True, align="right")
+
+    def banner(self, frame, title, subtitle, color):
+        w, h = 760, 120
+        x, y = (W - w) // 2, 200
+        self.panel(frame, x, y, w, h, color, alpha=0.74)
+        self.typo.draw(frame, title, W // 2, y + 18, 38, color, bold=True, mono=True, align="center")
+        self.typo.draw(frame, subtitle, W // 2, y + 76, 16, TEXT, mono=True, align="center")
 
 
 # ----------------------------------------------------------------------------
@@ -561,41 +714,309 @@ class Starfield:
 
 
 # ----------------------------------------------------------------------------
-# 8. APLICACIÓN
+# 8. FASES DEL JUEGO, DESAFÍO DE GESTOS Y TESSERACT
+# ----------------------------------------------------------------------------
+class Phase(Enum):
+    CHALLENGE = auto()    # protocolo de acceso: mostrar números con los dedos
+    PORTAL = auto()       # caída por el horizonte de sucesos
+    TESSERACT = auto()    # simulación del tesseract
+
+
+class WarpField:
+    """Estrellas en 3D que se estiran en estelas (efecto de caída por el portal)."""
+
+    def __init__(self, n: int = 650, seed: int = 1):
+        self.rng = np.random.default_rng(seed)
+        self.x = self.rng.uniform(-1, 1, n).astype(np.float32)
+        self.y = self.rng.uniform(-1, 1, n).astype(np.float32)
+        self.z = self.rng.uniform(0.05, 1.0, n).astype(np.float32)
+
+    def update_and_draw(self, frame: np.ndarray, speed: float, dt: float) -> None:
+        dz = speed * dt
+        z_new = self.z - dz
+        dead = z_new < 0.03
+        k = int(dead.sum())
+        if k:
+            self.x[dead] = self.rng.uniform(-1, 1, k)
+            self.y[dead] = self.rng.uniform(-1, 1, k)
+            z_new[dead] = self.rng.uniform(0.85, 1.0, k)
+        z_prev = np.minimum(z_new + dz * 4.0, 1.5)
+        self.z = z_new
+        cx, cy = W / 2, H / 2
+        px1, py1 = cx + self.x / z_new * (W / 2), cy + self.y / z_new * (H / 2)
+        px0, py0 = cx + self.x / z_prev * (W / 2), cy + self.y / z_prev * (H / 2)
+        bright = np.clip(1.15 - z_new, 0.15, 1.0)
+        for i in np.nonzero((px1 > -5) & (px1 < W + 5) & (py1 > -5) & (py1 < H + 5))[0]:
+            b = float(bright[i])
+            cv2.line(frame, (int(px0[i]), int(py0[i])), (int(px1[i]), int(py1[i])),
+                     (int(255 * b), int(235 * b), int(200 * b)), 2 if z_new[i] < 0.2 else 1)
+
+
+class ChallengeSystem:
+    """
+    Secuencia de gestos numéricos. Hay que mantener el número pedido durante
+    CHALLENGE_HOLD segundos. Con CHALLENGE_TOTAL aciertos se completa el protocolo.
+    Si se agota el tiempo se pierde un punto de sincronización (nunca baja de 0).
+    """
+
+    def __init__(self, seed: int = 11):
+        self.rng = np.random.default_rng(seed)
+        self.progress = 0
+        self.target = 0
+        self.hold = 0.0
+        self.time_left = CHALLENGE_TIME
+        self.message = ""
+        self.message_t = 0.0
+        self.complete = False
+        self.fails = 0
+        self._new_target()
+
+    def _new_target(self) -> None:
+        choices = [n for n in range(1, 6) if n != self.target]      # nunca repite el número anterior
+        self.target = int(self.rng.choice(choices))
+        self.hold, self.time_left = 0.0, CHALLENGE_TIME
+
+    def update(self, dt: float, number: Optional[int]) -> Optional[str]:
+        """Devuelve "ok" o "fail" si ocurrió algo en este fotograma."""
+        if self.complete:
+            return None
+        self.message_t = max(0.0, self.message_t - dt)
+        if number == self.target:
+            self.hold += dt
+        else:
+            self.hold = max(0.0, self.hold - dt * 2.0)               # tolera parpadeos del detector
+        self.time_left -= dt
+
+        if self.hold >= CHALLENGE_HOLD:
+            self.progress += 1
+            self.message, self.message_t = "SINCRONIZADO", 1.2
+            if self.progress >= CHALLENGE_TOTAL:
+                self.complete = True
+            else:
+                self._new_target()
+            return "ok"
+        if self.time_left <= 0:
+            self.progress = max(0, self.progress - 1)
+            self.fails += 1
+            self.message, self.message_t = "SEÑAL PERDIDA", 1.2
+            self._new_target()
+            return "fail"
+        return None
+
+
+def _rot4(i: int, j: int, a: float) -> np.ndarray:
+    """Matriz de rotación 4D en el plano (i, j)."""
+    m = np.eye(4, dtype=np.float32)
+    c, s = math.cos(a), math.sin(a)
+    m[i, i], m[j, j], m[i, j], m[j, i] = c, c, -s, s
+    return m
+
+
+class TesseractScene:
+    """
+    Simulación del tesseract: un hipercubo 4D girando dentro de un túnel de líneas
+    temporales. La mano recorre el tiempo (eje horizontal) y gira el hipercubo (vertical).
+    Cuando un recuerdo se alinea con el instante actual, el puño lo sella.
+    """
+
+    Z_RANGE = 11.0     # distancia en profundidad que recorre un recuerdo al moverse en el tiempo
+    Z_ALIGNED = 3.0    # profundidad a la que se ve un recuerdo cuando está alineado con el instante actual
+    ALIGN = 0.035      # tolerancia (en unidades de tiempo normalizado) para sellar un recuerdo
+    FOCAL = 520.0
+
+    def __init__(self, seed: int = 5):
+        rng = np.random.default_rng(seed)
+        self.verts = np.array(list(itertools.product((-1.0, 1.0), repeat=4)), np.float32)   # 16 vértices
+        self.edges = [(i, j) for i in range(16) for j in range(i + 1, 16)
+                      if int((self.verts[i] != self.verts[j]).sum()) == 1]                  # 32 aristas
+
+        taus: list = []
+        while len(taus) < MEMORIES:                                   # instantes separados entre sí
+            c = float(rng.uniform(0.08, 0.92))
+            if all(abs(c - t) > 0.12 for t in taus):
+                taus.append(c)
+        self.mem_tau = np.array(sorted(taus), np.float32)
+        xs, ys = np.array([-2.6, -1.7, 1.7, 2.6]), np.array([-1.6, -0.9, 0.9, 1.6])
+        self.mem_xy = np.stack((rng.choice(xs, MEMORIES), rng.choice(ys, MEMORIES)), axis=1)
+        self.collected = np.zeros(MEMORIES, bool)
+
+        self.t = 0.0
+        self.tau = 0.5
+        self.tau_target = 0.5
+        self.hy = 0.5
+        self.a_xw = self.a_yz = self.a_zw = self.a_xy = 0.0
+        self.rings: list = []          # (t0, px, py) ondas al sellar un recuerdo
+        self.done_t: Optional[float] = None
+
+    @property
+    def n_done(self) -> int:
+        return int(self.collected.sum())
+
+    @property
+    def done(self) -> bool:
+        return bool(self.collected.all())
+
+    def aligned_index(self) -> Optional[int]:
+        """Índice del recuerdo alineado con el instante actual (o None)."""
+        hit = np.nonzero(~self.collected & (np.abs(self.mem_tau - self.tau) < self.ALIGN))[0]
+        return int(hit[0]) if len(hit) else None
+
+    def update(self, dt: float, hand: Optional[np.ndarray], gesture: Optional[str]) -> None:
+        self.t += dt
+        if hand is not None:
+            self.tau_target = clamp((float(hand[0]) / W - 0.12) / 0.76)
+            self.hy = clamp(float(hand[1]) / H)
+        self.tau += (self.tau_target - self.tau) * min(1.0, dt * 7.0)
+
+        self.a_xw += dt * 0.35
+        self.a_yz += dt * 0.22
+        self.a_zw += ((self.hy - 0.5) * math.pi * 1.2 - self.a_zw) * min(1.0, dt * 4.0) if hand is not None else dt * 0.3
+        self.a_xy = self.tau * 2 * math.pi
+
+        if gesture == GESTURE_FIST and not self.done:
+            idx = self.aligned_index()
+            if idx is not None:
+                self.collected[idx] = True
+                z = self.Z_ALIGNED + float(self.mem_tau[idx] - self.tau) * self.Z_RANGE
+                px = W / 2 + self.mem_xy[idx, 0] / z * self.FOCAL
+                py = H / 2 + self.mem_xy[idx, 1] / z * self.FOCAL
+                self.rings.append((self.t, float(np.clip(px, 60, W - 60)), float(np.clip(py, 60, H - 60))))
+                if self.done:
+                    self.done_t = self.t
+        self.rings = [r for r in self.rings if self.t - r[0] < 1.3]
+
+    # ------------------------------------------------------------- dibujo
+    def _project(self, scale: float):
+        R = _rot4(0, 3, self.a_xw) @ _rot4(1, 2, self.a_yz) @ _rot4(2, 3, self.a_zw) @ _rot4(0, 1, self.a_xy)
+        v = self.verts @ R.T
+        w = v[:, 3]
+        p3 = v[:, :3] * (2.4 / (3.2 - w))[:, None]                    # perspectiva 4D -> 3D
+        f3 = 5.0 / (5.0 - p3[:, 2])                                   # perspectiva 3D -> 2D
+        return p3[:, :2] * f3[:, None] * scale + np.array([W / 2, H / 2], np.float32), w
+
+    def _draw_lattice(self, layer: np.ndarray) -> None:
+        """Túnel de líneas temporales: rieles que convergen y marcos que avanzan con el tiempo."""
+        cx, cy, F = W / 2, H / 2, self.FOCAL
+        z_near, z_far = 0.55, 10.0
+        xs, ys = np.arange(-4, 5, dtype=np.float32), np.arange(-3, 4, dtype=np.float32)
+        rail = (14, 42, 90)
+        for x in xs:
+            for y in ys:
+                cv2.line(layer, (int(cx + x / z_near * F), int(cy + y / z_near * F)),
+                         (int(cx + x / z_far * F), int(cy + y / z_far * F)), rail, 1)
+        nf = 16
+        for k in range(nf):
+            u = (k / nf - self.tau * 2.0) % 1.0                       # al avanzar el tiempo, el túnel se desplaza
+            z = z_near * (z_far / z_near) ** u
+            b = smoothstep(z_near, 1.4, z) * (1.0 - 0.6 * z / z_far)
+            if b < 0.08:
+                continue
+            col = (int(38 * b), int(105 * b), int(185 * b))
+            s = F / z
+            top, bot = int(cy - 3.5 * s), int(cy + 3.5 * s)
+            left, right = int(cx - 4.5 * s), int(cx + 4.5 * s)
+            for x in xs:
+                px = int(cx + x * s)
+                cv2.line(layer, (px, top), (px, bot), col, 1)
+            for y in ys:
+                py = int(cy + y * s)
+                cv2.line(layer, (left, py), (right, py), col, 1)
+
+    def _draw_memories(self, layer: np.ndarray) -> None:
+        cx, cy, F = W / 2, H / 2, self.FOCAL
+        aligned = self.aligned_index()
+        for i in range(MEMORIES):
+            if self.collected[i]:
+                continue
+            z = self.Z_ALIGNED + float(self.mem_tau[i] - self.tau) * self.Z_RANGE
+            if not 0.7 < z < 9.5:
+                continue
+            px, py = int(cx + self.mem_xy[i, 0] / z * F), int(cy + self.mem_xy[i, 1] / z * F)
+            r = int(clamp(60.0 / z, 4, 70))
+            if i == aligned:
+                pulse = 1.0 + 0.25 * math.sin(self.t * 10)
+                cv2.circle(layer, (px, py), int(r * 1.5 * pulse), (255, 255, 255), -1, cv2.LINE_AA)
+                cv2.circle(layer, (px, py), int(r * 2.4 * pulse), (255, 235, 140), 2, cv2.LINE_AA)
+            else:
+                cv2.circle(layer, (px, py), r, (255, 225, 120), -1, cv2.LINE_AA)
+                cv2.circle(layer, (px, py), int(r * 1.8), (200, 160, 60), 1, cv2.LINE_AA)
+
+    def _draw_hypercube(self, layer: np.ndarray) -> None:
+        boost = 0.0
+        if self.done_t is not None:
+            boost = smoothstep(0.0, 1.5, self.t - self.done_t)
+        pts_f, w = self._project(TESS_SCALE * (1.0 + 0.04 * math.sin(self.t * 2) + 0.3 * boost))
+        pts = pts_f.astype(int)
+        for i, j in self.edges:
+            b = clamp(0.62 + 0.22 * (float(w[i]) + float(w[j])) / 2 + 0.3 * boost, 0.3, 1.0)
+            cv2.line(layer, tuple(pts[i]), tuple(pts[j]), (int(175 * b), int(220 * b), int(255 * b)), 2, cv2.LINE_AA)
+        for p in pts:
+            cv2.circle(layer, tuple(p), 4, (255, 255, 255), -1, cv2.LINE_AA)
+
+    def render(self, frame: np.ndarray) -> None:
+        layer = np.zeros((H, W, 3), np.uint8)
+        self._draw_lattice(layer)
+        self._draw_memories(layer)
+        self._draw_hypercube(layer)
+        for t0, px, py in self.rings:                                 # ondas al sellar un recuerdo
+            age = (self.t - t0) / 1.3
+            cv2.circle(layer, (int(px), int(py)), int(age * 520), (int(255 * (1 - age)),) * 3, 3, cv2.LINE_AA)
+        if self.done_t is not None and int((self.t - self.done_t) * 1.6) != int((self.t - self.done_t - 0.03) * 1.6):
+            self.rings.append((self.t, W / 2, H / 2))                 # latido continuo al completar
+
+        small = cv2.GaussianBlur(cv2.resize(layer, (W // 4, H // 4), interpolation=cv2.INTER_AREA), (0, 0), 2.2)
+        glow = cv2.resize(small, (W, H), interpolation=cv2.INTER_LINEAR)
+        frame[:] = cv2.convertScaleAbs(frame, alpha=0.14)             # la cámara queda casi apagada
+        frame[:] = cv2.add(frame, layer)
+        frame[:] = cv2.addWeighted(frame, 1.0, glow, 1.05, 0)
+
+
+# ----------------------------------------------------------------------------
+# 9. APLICACIÓN
 # ----------------------------------------------------------------------------
 class BlackHoleGame:
     def __init__(self):
         self.typo = Typography()
         self.hud = HUD(self.typo)
         self.stars = Starfield()
-        self.particles = ParticleSystem()
+        self.warp = WarpField()
         self.glow = make_glow_sprite(256, (40, 140, 255), 0.55)
         self.navy_frame = np.full((H, W, 3), NAVY, np.uint8)
+        self.white_frame = np.full((H, W, 3), 255, np.uint8)
+        self.red_frame = np.full((H, W, 3), (0, 0, 170), np.uint8)
         self.cockpit_mask = self._make_cockpit_mask()
 
-        # Estado de juego
+        self.anim_t = 0.0
+        self.fps = 30.0
+        self.show_skeleton = True
+        self.override: Optional[str] = None            # gesto simulado con el teclado (L / puño / abierta)
+        self.override_number: Optional[int] = None     # número simulado con el teclado
+        self.l_hold = 0.0
+        self.l_armed = False
+        self.next_script: Optional[str] = None
+        self.hand_pos: Optional[np.ndarray] = None
+        self.hand_vel = np.zeros(2, np.float32)
+        self.mode = "none"
+        self._dt = 1 / 30
+        self.reset_run()
+
+    def reset_run(self) -> None:
+        """Reinicia la secuencia completa (desafío -> portal -> tesseract)."""
+        self.particles = ParticleSystem()
+        self.challenge = ChallengeSystem()
+        self.tess = TesseractScene()
         self.score = 0
         self.swallowed_total = 0
         self.mass = 1.0
         self.combo = 0
         self.last_swallow_t = -99.0
         self.pulse = 0.0
-        self.popups = []            # [texto, x, y, tiempo_creación, color]
-        self.shocks = []            # tiempos de creación de ondas de choque en el horizonte
-        self.anim_t = 0.0
-        self.fps = 30.0
-
-        # Mano
-        self.hand_pos: Optional[np.ndarray] = None
-        self.hand_vel = np.zeros(2, np.float32)
-        self.mode = "none"
-        self.show_skeleton = True
-
-        # Cambio de programa con el gesto "L"
-        self.override: Optional[str] = None
-        self.l_hold = 0.0
-        self.l_armed = False
-        self.next_script: Optional[str] = None
+        self.fail_flash = 0.0
+        self.popups: list = []
+        self.shocks: list = []
+        self.gate_rings: list = []
+        self.phase = Phase.CHALLENGE
+        self.phase_t = 0.0
 
     @staticmethod
     def _make_cockpit_mask() -> np.ndarray:
@@ -618,13 +1039,15 @@ class BlackHoleGame:
     def combo_mult(self) -> int:
         return 1 + min(self.combo, 12) // 3
 
+    def _set_phase(self, phase: Phase) -> None:
+        self.phase, self.phase_t = phase, 0.0
+
     # ------------------------------------------------------------------ lógica
-    def _update_hand(self, dt: float, landmarks: Optional[np.ndarray], gesture: Optional[str]) -> None:
+    def _update_hand(self, dt: float, landmarks: Optional[np.ndarray], gesture: Optional[str],
+                     number: Optional[int]) -> None:
         """Posición suavizada de la palma, velocidad de la mano y modo de interacción."""
         if landmarks is None:
-            self.hand_pos = None
-            self.hand_vel *= 0.0
-            self.mode = "none"
+            self.hand_pos, self.hand_vel, self.mode = None, np.zeros(2, np.float32), "none"
             return
         palm = landmarks[[0, 5, 9, 13, 17]].mean(axis=0).astype(np.float32)
         if self.hand_pos is None:
@@ -634,10 +1057,10 @@ class BlackHoleGame:
             vel = np.clip((new_pos - self.hand_pos) / max(dt, 1e-3), -1800, 1800)
             self.hand_vel = self.hand_vel * 0.6 + vel * 0.4
             self.hand_pos = new_pos
-        if gesture == GESTURE_FIST:
+        if number in (1, 2, 3, 4) or gesture == GESTURE_L:
+            self.mode = "none"                    # contando con los dedos o haciendo la L: sin campo
+        elif gesture == GESTURE_FIST:
             self.mode = "grab"
-        elif gesture == GESTURE_L:
-            self.mode = "none"
         else:
             self.mode = "attract"
 
@@ -659,20 +1082,46 @@ class BlackHoleGame:
                 print(f"[aviso] No se encontró {NEXT_SCRIPT} en {BASE_DIR}")
                 self.l_hold, self.l_armed = 0.0, False
 
-    def update(self, dt: float, landmarks: Optional[np.ndarray], gesture: Optional[str]) -> None:
+    def _step_particles(self, dt: float, gm_mult: float, use_hand: bool = True) -> None:
+        hand = self.hand_pos if use_hand else None
+        mode = self.mode if use_hand else "none"
+        vel = self.hand_vel if hand is not None else np.zeros(2, np.float32)
+        for s in self.particles.update(dt, self.gm * gm_mult, self.r_horizon, hand, vel, mode):
+            self._score_swallowed(s)
+
+    def update(self, dt: float, landmarks: Optional[np.ndarray], gesture: Optional[str],
+               number: Optional[int] = None) -> None:
+        self._dt = dt
         self.anim_t += dt
+        self.phase_t += dt
         self.pulse = max(0.0, self.pulse - dt * 1.6)
+        self.fail_flash = max(0.0, self.fail_flash - dt * 1.8)
         self.shocks = [t for t in self.shocks if self.anim_t - t < 0.9]
         self.popups = [p for p in self.popups if self.anim_t - p[3] < 1.1]
+        self.gate_rings = [t for t in self.gate_rings if self.anim_t - t < 1.2]
         if self.anim_t - self.last_swallow_t > COMBO_WINDOW:
             self.combo = 0
 
         self._update_l_hold(dt, gesture)
-        self._update_hand(dt, landmarks, gesture)
+        self._update_hand(dt, landmarks, gesture, number)
 
-        hand_vel = self.hand_vel if self.hand_pos is not None else np.zeros(2, np.float32)
-        for s in self.particles.update(dt, self.gm, self.r_horizon, self.hand_pos, hand_vel, self.mode):
-            self._score_swallowed(s)
+        if self.phase == Phase.CHALLENGE:
+            event = self.challenge.update(dt, None if gesture == GESTURE_L else number)
+            if event == "ok":
+                self.gate_rings.append(self.anim_t)
+                self.pulse = 1.0
+            elif event == "fail":
+                self.fail_flash = 1.0
+            self._step_particles(dt, 1.0)
+            if self.challenge.complete:
+                self._set_phase(Phase.PORTAL)
+        elif self.phase == Phase.PORTAL:
+            p = clamp(self.phase_t / T_PORTAL)
+            self._step_particles(dt, 1.0 + 10.0 * p * p, use_hand=False)      # el agujero arrastra todo
+            if self.phase_t >= T_PORTAL:
+                self._set_phase(Phase.TESSERACT)
+        else:
+            self.tess.update(dt, self.hand_pos, gesture)
 
     def _score_swallowed(self, s: Swallowed) -> None:
         self.combo += 1
@@ -686,44 +1135,56 @@ class BlackHoleGame:
         self.shocks.append(self.anim_t)
         label = f"+{points}" + (f" x{mult}" if mult > 1 else "") + (" TIRO CERTERO" if s.thrown else "")
         self.popups.append([label, float(s.pos[0]), float(s.pos[1]), self.anim_t, KIND_COLOR[s.kind]])
-        self.popups = self.popups[-6:]                      # evita amontonar textos si caen muchas a la vez
+        self.popups = self.popups[-6:]
 
     # ------------------------------------------------------------------ dibujo
-    def _draw_hole_back(self, frame: np.ndarray) -> None:
-        """Halo y mitad trasera del disco de acreción (detrás de las partículas)."""
-        t, r = self.anim_t, self.r_horizon
+    def _draw_hole_back(self, frame: np.ndarray, k: float = 1.0) -> None:
+        """Halo y mitad trasera del disco de acreción (k > 1 acerca la cámara al agujero)."""
+        t, r = self.anim_t, self.r_horizon * k
         cx, cy = int(CENTER[0]), int(CENTER[1])
-        size = int((r + 150) * 2 * (1 + 0.03 * math.sin(t * 2)))
+        size = int(min(2400, (r + 150 * k) * 2 * (1 + 0.03 * math.sin(t * 2))))
         add_glow(frame, cv2.resize(self.glow, (size, size)), cx, cy, 0.55 + 0.35 * self.pulse)
         for i in range(11):
-            rx = int(r + 16 + i * 10 + 2 * math.sin(t * 3 + i))
+            rx = int(r + (16 + i * 10 + 2 * math.sin(t * 3 + i)) * k)
             col = hot_color(i / 10, 1.0 - 0.45 * i / 10 + 0.12 * math.sin(t * 3 + i))
-            cv2.ellipse(frame, (cx, cy), (rx, int(rx * 0.26)), -10, 180, 360, col, 2, cv2.LINE_AA)
+            cv2.ellipse(frame, (cx, cy), (rx, max(1, int(rx * 0.26))), -10, 180, 360, col, 2, cv2.LINE_AA)
 
-    def _draw_hole_front(self, frame: np.ndarray) -> None:
+    def _draw_hole_front(self, frame: np.ndarray, k: float = 1.0) -> None:
         """Núcleo negro, mitad delantera del disco, puntos calientes y ondas de choque."""
-        t, r = self.anim_t, self.r_horizon
+        t, r = self.anim_t, self.r_horizon * k
         cx, cy = int(CENTER[0]), int(CENTER[1])
         cv2.circle(frame, (cx, cy), int(r), (0, 0, 0), -1, cv2.LINE_AA)
         for i in range(11):
-            rx = int(r + 16 + i * 10 + 2 * math.sin(t * 3 + i))
+            rx = int(r + (16 + i * 10 + 2 * math.sin(t * 3 + i)) * k)
             col = hot_color(i / 10, 1.0 - 0.45 * i / 10 + 0.12 * math.sin(t * 3 + i))
-            cv2.ellipse(frame, (cx, cy), (rx, int(rx * 0.26)), -10, 0, 180, col, 2, cv2.LINE_AA)
+            cv2.ellipse(frame, (cx, cy), (rx, max(1, int(rx * 0.26))), -10, 0, 180, col, 2, cv2.LINE_AA)
 
-        # Puntos calientes que recorren el disco
         th = math.radians(-10)
-        for k in range(6):
-            a = math.radians((t * (55 + 20 * k) + k * 60) % 360)
-            rx = r + 26 + k * 14
+        for j in range(6):                                                    # puntos calientes del disco
+            a = math.radians((t * (55 + 20 * j) + j * 60) % 360)
+            rx = r + (26 + j * 14) * k
             x, y = rx * math.cos(a), rx * 0.26 * math.sin(a)
             px, py = cx + x * math.cos(th) - y * math.sin(th), cy + x * math.sin(th) + y * math.cos(th)
-            if math.sin(a) > 0 or math.hypot(px - cx, py - cy) > r:      # no pintar si queda tras el núcleo
+            if math.sin(a) > 0 or math.hypot(px - cx, py - cy) > r:
                 cv2.circle(frame, (int(px), int(py)), 3, (230, 250, 255), -1, cv2.LINE_AA)
 
-        cv2.circle(frame, (cx, cy), int(r) + 1, (205, 235, 255), 2, cv2.LINE_AA)     # anillo de fotones
-        for t0 in self.shocks:                                                         # ondas al tragar
+        cv2.circle(frame, (cx, cy), int(r) + 1, (205, 235, 255), 2, cv2.LINE_AA)   # anillo de fotones
+        for t0 in self.shocks:                                                     # ondas al tragar
             age = (self.anim_t - t0) / 0.9
-            cv2.circle(frame, (cx, cy), int(r + 8 + age * 90), hot_color(0.2 + age * 0.5, 1 - age), 2, cv2.LINE_AA)
+            cv2.circle(frame, (cx, cy), int(r + (8 + age * 90) * k), hot_color(0.2 + age * 0.5, 1 - age), 2, cv2.LINE_AA)
+
+    def _draw_gate_rings(self, frame: np.ndarray) -> None:
+        """Un anillo por cada gesto completado, más una onda de luz en cada acierto."""
+        cx, cy = int(CENTER[0]), int(CENTER[1])
+        base = int(self.r_horizon + 150)
+        for i in range(self.challenge.progress):
+            a0 = (self.anim_t * (40 + 12 * i) + i * 72) % 360
+            r = base + i * 16
+            cv2.ellipse(frame, (cx, cy), (r, r), 0, a0, a0 + 250, CYAN if i % 2 == 0 else WHITE, 2, cv2.LINE_AA)
+        for t0 in self.gate_rings:
+            age = (self.anim_t - t0) / 1.2
+            cv2.circle(frame, (cx, cy), int(base * 0.5 + age * 460), tuple(int(c * (1 - age)) for c in (255, 255, 200)),
+                       3, cv2.LINE_AA)
 
     def _draw_particles(self, frame: np.ndarray) -> None:
         ps = self.particles
@@ -744,14 +1205,14 @@ class BlackHoleGame:
         cx, cy = int(self.hand_pos[0]), int(self.hand_pos[1])
         t = self.anim_t
         if self.mode == "attract":
-            cv2.circle(frame, (cx, cy), int(HAND_RANGE), (90, 70, 30), 1, cv2.LINE_AA)       # alcance del campo
+            cv2.circle(frame, (cx, cy), int(HAND_RANGE), (90, 70, 30), 1, cv2.LINE_AA)
             for k in range(3):
                 a = (t * 70 + k * 120) % 360
                 cv2.ellipse(frame, (cx, cy), (70, 70), 0, a, a + 60, CYAN, 3, cv2.LINE_AA)
         elif self.mode == "grab":
             cv2.circle(frame, (cx, cy), int(GRAB_RADIUS), (60, 90, 160), 1, cv2.LINE_AA)
             cv2.circle(frame, (cx, cy), 34, AMBER, 3, cv2.LINE_AA)
-            for k in range(4):                                                               # mira de la pinza
+            for k in range(4):
                 a = math.radians(k * 90 + 45 + t * 40)
                 cv2.line(frame, (int(cx + 46 * math.cos(a)), int(cy + 46 * math.sin(a))),
                          (int(cx + 62 * math.cos(a)), int(cy + 62 * math.sin(a))), AMBER, 3, cv2.LINE_AA)
@@ -763,58 +1224,103 @@ class BlackHoleGame:
         for q in p:
             cv2.circle(frame, tuple(q), 4, WHITE, -1, cv2.LINE_AA)
 
-    def render(self, frame: np.ndarray, landmarks: Optional[np.ndarray], gesture: Optional[str]) -> np.ndarray:
-        """Compone un fotograma a partir del frame de cámara (ya en W x H)."""
-        # 1) Cámara oscurecida con tinte azul + estrellas
+    def _gesture_label(self, has_hand: bool, gesture: Optional[str], number: Optional[int]):
+        if self.override or self.override_number:
+            return "TECLADO", AMBER
+        if number:
+            return f"NÚMERO {number}", GREEN
+        if gesture == GESTURE_L:
+            return "GESTO L", AMBER
+        if gesture == GESTURE_OPEN:
+            return "MANO ABIERTA", GREEN
+        if gesture == GESTURE_FIST:
+            return "PUÑO CERRADO", AMBER
+        return ("DETECTANDO…", TEXT_DIM) if has_hand else ("SIN MANO", RED)
+
+    # --- fase 1 ---
+    def _render_challenge(self, frame, has_hand, gesture, number) -> None:
         frame[:] = cv2.addWeighted(frame, 0.22, self.navy_frame, 0.78, 0)
         self.stars.draw(frame, self.anim_t)
-
-        # 2) Agujero negro y partículas (el orden hace que lo tragado desaparezca tras el núcleo)
         self._draw_hole_back(frame)
         self._draw_particles(frame)
         self._draw_hand_field(frame)
         self._draw_hole_front(frame)
+        self._draw_gate_rings(frame)
+        if self.fail_flash > 0.01:
+            frame[:] = cv2.addWeighted(frame, 1.0, self.red_frame, 0.28 * self.fail_flash, 0)
 
-        # 3) Mano
-        if self.show_skeleton and landmarks is not None:
+    # --- fase 2 ---
+    def _render_portal(self, frame) -> None:
+        p = clamp(self.phase_t / T_PORTAL)
+        frame[:] = cv2.addWeighted(frame, 0.12, self.navy_frame, 0.88, 0)
+        self.warp.update_and_draw(frame, lerp(0.25, 3.4, p * p), self._dt)
+        k = 1.0 + 9.0 * p ** 3
+        self._draw_hole_back(frame, k)
+        self._draw_hole_front(frame, k)
+        if p > 0.78:                                                    # destello blanco final
+            f = (p - 0.78) / 0.22
+            frame[:] = cv2.addWeighted(frame, 1 - f, self.white_frame, f, 0)
+
+    # --- fase 3 ---
+    def _render_tesseract(self, frame) -> None:
+        self.tess.render(frame)
+        if self.phase_t < 1.2:                                          # destello al entrar
+            f = 1.0 - self.phase_t / 1.2
+            frame[:] = cv2.addWeighted(frame, 1 - f, self.white_frame, f, 0)
+
+    def render(self, frame: np.ndarray, landmarks: Optional[np.ndarray], gesture: Optional[str],
+               number: Optional[int] = None) -> np.ndarray:
+        """Compone un fotograma a partir del frame de cámara (ya en W x H)."""
+        has_hand = landmarks is not None
+        g_label, g_color = self._gesture_label(has_hand, gesture, number)
+        hud = self.hud
+
+        if self.phase == Phase.CHALLENGE:
+            self._render_challenge(frame, has_hand, gesture, number)
+        elif self.phase == Phase.PORTAL:
+            self._render_portal(frame)
+        else:
+            self._render_tesseract(frame)
+
+        if self.show_skeleton and has_hand and not (self.phase == Phase.PORTAL and self.phase_t > T_PORTAL * 0.78):
             self._draw_skeleton(frame, landmarks)
 
-        # 4) Textos flotantes de puntos
-        for text, x, y, t0, color in self.popups:
-            age = (self.anim_t - t0) / 1.1
-            self.typo.draw(frame, text, int(x), int(y - 40 * age), 18, color, bold=True, mono=True,
-                           align="center", opacity=1.0 - age)
+        # ---- HUD según la fase ----
+        hud.screen_corners(frame, CYAN)
+        warning = None if has_hand or self.override or self.override_number else "SIN SEÑAL DE MANO · COLÓCALA FRENTE A LA CÁMARA"
 
-        # 5) HUD
-        has_hand = landmarks is not None
-        if self.override:
-            g_label, g_color = "TECLADO: L", AMBER
-        elif gesture == GESTURE_L:
-            g_label, g_color = "GESTO L", AMBER
-        elif gesture == GESTURE_OPEN:
-            g_label, g_color = "MANO ABIERTA", GREEN
-        elif gesture == GESTURE_FIST:
-            g_label, g_color = "PUÑO CERRADO", AMBER
+        if self.phase == Phase.CHALLENGE:
+            for text, x, y, t0, color in self.popups:
+                age = (self.anim_t - t0) / 1.1
+                self.typo.draw(frame, text, int(x), int(y - 40 * age), 18, color, bold=True, mono=True,
+                               align="center", opacity=1.0 - age)
+            status = {"attract": ("CAMPO ATRACTOR ACTIVO", CYAN), "grab": ("PINZA GRAVITATORIA", AMBER),
+                      "none": ("PROTOCOLO DE ACCESO ACTIVO", CYAN)}[self.mode]
+            hud.top_bar(frame, status[0], status[1], f"PUNTOS {self.score:,}".replace(",", "."))
+            hud.stats(frame, self.score, self.combo_mult, self.particles.n_held, self.swallowed_total,
+                      self.mass, g_label, g_color, self.fps)
+            hud.challenge_panel(frame, self.challenge)
+            hud.hint(frame, f"MUESTRA {self.challenge.target} CON LOS DEDOS Y MANTÉN EL GESTO", CYAN, warning)
+        elif self.phase == Phase.PORTAL:
+            hud.top_bar(frame, "ACCESO CONCEDIDO", GREEN, "CRUZANDO EL HORIZONTE")
+            hud.banner(frame, "ACCESO CONCEDIDO", "CRUZANDO EL HORIZONTE DE SUCESOS…", GREEN)
         else:
-            g_label, g_color = ("DETECTANDO…", TEXT_DIM) if has_hand else ("SIN MANO", RED)
+            tess = self.tess
+            aligned = tess.aligned_index()
+            hud.top_bar(frame, "TESSERACT · BIBLIOTECA DEL TIEMPO", AMBER, f"RECUERDOS {tess.n_done}/{MEMORIES}")
+            hud.tess_stats(frame, tess.tau, tess.n_done, math.degrees(tess.a_zw) % 360, g_label, g_color, self.fps)
+            hud.timeline(frame, tess.tau, tess.mem_tau, tess.collected, aligned)
+            if tess.done:
+                hud.banner(frame, "MENSAJE ENTREGADO", "TODOS LOS RECUERDOS SELLADOS · SIMULACIÓN COMPLETADA", GREEN)
+                hud.hint(frame, "HAZ LA L (2 s) PARA VOLVER AL MUSEO ESPACIAL", GREEN, warning)
+            elif aligned is not None:
+                hud.hint(frame, "INSTANTE ALINEADO · CIERRA EL PUÑO AHORA", GREEN, warning)
+            else:
+                hud.hint(frame, "MUEVE LA MANO (IZQ/DER) · PUÑO PARA SELLAR EL RECUERDO", AMBER, warning)
 
-        status = {"attract": ("CAMPO ATRACTOR ACTIVO", CYAN), "grab": ("PINZA GRAVITATORIA", AMBER),
-                  "none": ("SIN SEÑAL DE MANO" if not has_hand else "GESTO L EN CURSO",
-                           RED if not has_hand else AMBER)}[self.mode]
-        hints = {"attract": ("PUÑO: ATRAPAR · ABRE LA MANO PARA ATRAER PARTÍCULAS", CYAN),
-                 "grab": ("LLÉVALAS AL AGUJERO Y ABRE LA MANO PARA LANZARLAS", AMBER),
-                 "none": (("COLOCA LA MANO FRENTE A LA CÁMARA", AMBER) if not has_hand
-                          else ("MANTÉN LA L PARA VOLVER AL MUSEO ESPACIAL", AMBER))}
-        self.hud.screen_corners(frame, CYAN)
-        self.hud.top_bar(frame, status[0], status[1], f"PUNTOS {self.score:,}".replace(",", "."))
-        self.hud.stats(frame, self.score, self.combo_mult, self.particles.n_held, self.swallowed_total,
-                       self.mass, g_label, g_color, self.fps)
-        self.hud.hint(frame, hints[self.mode][0], hints[self.mode][1])
-        self.hud.keys_help(frame)
+        hud.keys_help(frame)
         if self.l_hold > 0.05:
-            self.hud.l_progress(frame, self.l_hold / L_HOLD_SECONDS, "MUSEO ESPACIAL")
-
-        # 6) Viñeta y líneas de escaneo
+            hud.l_progress(frame, self.l_hold / L_HOLD_SECONDS, "MUSEO ESPACIAL")
         return cv2.multiply(frame, self.cockpit_mask, scale=1 / 255.0)
 
     # --------------------------------------------------------------- principal
@@ -853,8 +1359,9 @@ class BlackHoleGame:
                 frame = fit_frame(cv2.flip(raw, 1))
                 detector.process(frame)
                 gesture = self.override or detector.stable
-                self.update(dt, detector.landmarks, gesture)
-                cv2.imshow(WINDOW_NAME, self.render(frame, detector.landmarks, gesture))
+                number = self.override_number if self.override_number is not None else detector.stable_number
+                self.update(dt, detector.landmarks, gesture, number)
+                cv2.imshow(WINDOW_NAME, self.render(frame, detector.landmarks, gesture, number))
                 if self.next_script:                           # gesto L mantenido: salir para volver a main.py
                     break
 
@@ -863,10 +1370,18 @@ class BlackHoleGame:
                     break
                 if key == ord("h"):
                     self.show_skeleton = not self.show_skeleton
+                elif key in (ord("1"), ord("2"), ord("3"), ord("4"), ord("5")):
+                    self.override_number = key - ord("0")
                 elif key == ord("l"):
                     self.override = GESTURE_L
+                elif key == ord("f"):
+                    self.override = GESTURE_FIST
+                elif key == ord("o"):
+                    self.override = GESTURE_OPEN
                 elif key == ord("c"):
-                    self.override = None
+                    self.override, self.override_number = None, None
+                elif key == ord("r"):
+                    self.reset_run()
                 if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
                     break
         finally:
