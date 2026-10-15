@@ -1,26 +1,40 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-
+MUSEO ESPACIAL — viaje interestelar controlado con gestos de la mano
+=====================================================================
 
 Gestos (cámara + MediaPipe):
     MANO ABIERTA ... la nave viaja a la velocidad de la luz (efecto hiperespacio)
     PUÑO CERRADO ... la nave frena, llega al planeta y se muestra su ficha de museo
     MANO ABIERTA ... (de nuevo) despega hacia el siguiente destino
+    GESTO "L" ...... (pulgar e índice en ángulo recto, mantenido 2 s) cierra este
+                     programa y abre automáticamente agujero_negro.py
 
 Teclado:
     Q / ESC .... salir            H ... mostrar/ocultar esqueleto de la mano
     M .......... silenciar        O / F ... simular mano abierta / puño (sin cámara)
     C .......... volver a usar los gestos reales de la cámara
 
+Estructura del proyecto:
+    museo_espacial/
+    ├── main.py
+    ├── requirements.txt
+    └── assets/
+        ├── planets/   <- PNG con canal alfa (marte.png, jupiter.png, ...)
+        ├── sounds/    <- hyperspace.wav, brake.wav, arrival.wav
+        └── models/    <- hand_landmarker.task (se descarga solo la primera vez)
 
-
+Si faltan imágenes o sonidos, el programa genera versiones de marcador
+(procedurales) y las guarda en esas carpetas. Basta con reemplazarlos por tus
+propios archivos con el mismo nombre.
 """
 
 from __future__ import annotations
 
 import math
 import os
+import subprocess
 import sys
 import time
 import urllib.request
@@ -51,7 +65,19 @@ HAND_MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/hand_landmark
                   "hand_landmarker/float16/1/hand_landmarker.task")
 
 W, H = 1280, 720                 # resolución interna de la ventana (16:9)
-CAMERA_INDEX = 0
+
+
+def _camera_from_args(default: int = 0) -> int:
+    """Permite heredar la cámara del otro script: python main.py --camera 1"""
+    if "--camera" in sys.argv:
+        try:
+            return int(sys.argv[sys.argv.index("--camera") + 1])
+        except (IndexError, ValueError):
+            pass
+    return default
+
+
+CAMERA_INDEX = _camera_from_args(0)
 WINDOW_NAME = "Museo Espacial"
 
 # Tiempos de la máquina de estados (segundos)
@@ -68,7 +94,12 @@ PLANET_BASE = 540                # tamaño base del sprite en pantalla (px)
 CARD_W = 540
 CARD_TOP, CARD_MAX_H = 84, 556
 
-GESTURE_OPEN, GESTURE_FIST = "open", "fist"
+GESTURE_OPEN, GESTURE_FIST, GESTURE_L = "open", "fist", "l"
+
+# Salto entre aplicaciones mediante el gesto "L"
+NEXT_SCRIPT = "agujero_negro.py"
+L_HOLD_SECONDS = 2.0             # tiempo que hay que mantener la "L" para cambiar de programa
+L_ANGLE_RANGE = (60.0, 120.0)    # ángulo (grados) permitido entre pulgar e índice
 
 # Colores en BGR (OpenCV)
 CYAN = (255, 225, 100)
@@ -765,11 +796,23 @@ class GestureDetector:
             return float(np.linalg.norm(pts[a] - pts[b]))
 
         palm = dist(0, 9) + 1e-6                        # muñeca -> base del dedo corazón
-        extended = sum(1 for tip, pip in cls.FINGERS
-                       if dist(0, tip) > dist(0, pip) * 1.18 and dist(0, tip) > palm * 1.3)
-        if extended >= 4:
+        ext = [dist(0, tip) > dist(0, pip) * 1.18 and dist(0, tip) > palm * 1.3
+               for tip, pip in cls.FINGERS]             # índice, corazón, anular, meñique
+        if sum(ext) >= 4:
             return GESTURE_OPEN
-        if extended <= 1:
+
+        # "L": índice extendido, los otros tres dedos cerrados, pulgar abierto y ~90° entre ambos
+        if ext[0] and not any(ext[1:]):
+            thumb_out = dist(4, 9) > palm * 0.85 and dist(4, 5) > palm * 0.55
+            if thumb_out:
+                v_thumb, v_index = pts[4] - pts[2], pts[8] - pts[5]
+                cos = float(np.dot(v_thumb, v_index) /
+                            (np.linalg.norm(v_thumb) * np.linalg.norm(v_index) + 1e-6))
+                angle = math.degrees(math.acos(max(-1.0, min(1.0, cos))))
+                if L_ANGLE_RANGE[0] <= angle <= L_ANGLE_RANGE[1]:
+                    return GESTURE_L
+
+        if sum(ext) <= 1:
             return GESTURE_FIST
         return None                                      # gesto ambiguo (p. ej. señal de paz)
 
@@ -952,7 +995,7 @@ class HUD:
         T.draw(frame, f"{fps:4.0f}", x + w - 16, y + 136, 13, TEXT_DIM, mono=True, align="right")
 
     def hint(self, frame, text, color, warning=None):
-        w, h = 700, 44
+        w, h = 640, 44
         x, y = 380, H - 76
         self.panel(frame, x, y, w, h, color, alpha=0.62)
         self.typo.draw(frame, text, x + w // 2, y + 11, 17, color, bold=True, mono=True, align="center")
@@ -960,8 +1003,22 @@ class HUD:
             self.typo.draw(frame, warning, x + w // 2, y - 28, 15, AMBER, bold=True, mono=True, align="center")
 
     def keys_help(self, frame):
-        self.typo.draw(frame, "Q salir · H mano · M sonido · O/F/C teclado", W - 28, H - 24, 13, TEXT_DIM,
+        self.typo.draw(frame, "GESTO L (2 s): AGUJERO NEGRO", W - 28, H - 46, 12, AMBER, mono=True, align="right")
+        self.typo.draw(frame, "Q salir · H mano · M sonido · O/F/L/C teclado", W - 28, H - 24, 12, TEXT_DIM,
                        mono=True, align="right")
+
+    def l_progress(self, frame, progress: float, destination: str):
+        """Barra de carga mientras se mantiene el gesto L."""
+        w, h = 540, 56
+        x, y = (W - w) // 2, 84
+        self.panel(frame, x, y, w, h, AMBER, alpha=0.72)
+        self.typo.draw(frame, f"GESTO L DETECTADO · SALTANDO A {destination}", x + w // 2, y + 7, 15, AMBER,
+                       bold=True, mono=True, align="center")
+        bx, by, bw, bh = x + 20, y + 34, w - 40, 10
+        cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), (140, 160, 175), 1)
+        fill = int((bw - 2) * clamp(progress))
+        if fill > 0:
+            cv2.rectangle(frame, (bx + 1, by + 1), (bx + 1 + fill, by + bh - 1), AMBER, -1)
 
     def reticle(self, frame, center, radius, color, t, thick=2):
         """Arcos giratorios estilo 'bloqueo de objetivo'."""
@@ -1036,6 +1093,9 @@ class SpaceMuseum:
         self.flash = 0.0
         self.fps = 30.0
         self.override: Optional[str] = None     # gesto simulado con el teclado
+        self.l_hold = 0.0                       # segundos acumulados con la "L" estable
+        self.l_armed = False                    # la "L" solo cuenta tras haber soltado el gesto una vez
+        self.next_script: Optional[str] = None  # si se rellena, run() termina y se lanza ese script
         self.show_skeleton = True
 
     # ------------------------------------------------------------------ capas
@@ -1082,6 +1142,7 @@ class SpaceMuseum:
     def update(self, dt: float, gesture: Optional[str]) -> None:
         self.anim_t += dt
         self.state_t += dt
+        self._update_l_hold(dt, gesture)
         self.flash = max(0.0, self.flash - dt * 1.4)
         k = min(1.0, dt * 3.0)
         s = self.state
@@ -1112,6 +1173,28 @@ class SpaceMuseum:
         target_dim = {State.STANDBY: 0.55, State.HYPERSPACE: 0.82, State.BRAKING: 0.55,
                       State.ARRIVED: 0.55, State.DEPARTING: 0.70}[self.state]
         self.dim += (target_dim - self.dim) * min(1.0, dt * 4.0)
+
+    def _update_l_hold(self, dt: float, gesture: Optional[str]) -> None:
+        """
+        Cuenta cuánto tiempo se mantiene la "L". Si el programa acaba de abrirse
+        con la "L" todavía hecha (porque venimos del otro script), se ignora hasta
+        que el usuario la suelte: así no se produce un rebote entre programas.
+        """
+        if not self.l_armed:
+            self.l_hold = 0.0
+            if gesture != GESTURE_L and self.anim_t > 1.0:
+                self.l_armed = True
+            return
+        if gesture == GESTURE_L:
+            self.l_hold += dt
+        else:
+            self.l_hold = max(0.0, self.l_hold - dt * 2.0)    # tolera parpadeos breves del detector
+        if self.l_hold >= L_HOLD_SECONDS:
+            if (BASE_DIR / NEXT_SCRIPT).exists():
+                self.next_script = NEXT_SCRIPT
+            else:
+                print(f"[aviso] No se encontró {NEXT_SCRIPT} en {BASE_DIR}")
+                self.l_hold, self.l_armed = 0.0, False
 
     # --------------------------------------------------------------- animación
     def _planet_pose(self):
@@ -1213,7 +1296,10 @@ class SpaceMuseum:
 
         gesture = self.override or (detector.stable if detector else None)
         if self.override:
-            g_label, g_color = ("TECLADO: ABIERTA" if gesture == GESTURE_OPEN else "TECLADO: PUÑO"), AMBER
+            g_label, g_color = "TECLADO: " + {GESTURE_OPEN: "ABIERTA", GESTURE_FIST: "PUÑO",
+                                               GESTURE_L: "L"}.get(gesture, "?"), AMBER
+        elif gesture == GESTURE_L:
+            g_label, g_color = "GESTO L", AMBER
         elif gesture == GESTURE_OPEN:
             g_label, g_color = "MANO ABIERTA", GREEN
         elif gesture == GESTURE_FIST:
@@ -1233,12 +1319,15 @@ class SpaceMuseum:
         warning = "SIN SEÑAL DE MANO · COLÓCALA FRENTE A LA CÁMARA" if (pts is None and not self.override) else None
         self.hud.hint(frame, hint_text, hint_color, warning)
         self.hud.keys_help(frame)
+        if self.l_hold > 0.05:
+            self.hud.l_progress(frame, self.l_hold / L_HOLD_SECONDS, "AGUJERO NEGRO")
 
         # 7) Viñeta y líneas de escaneo
         return cv2.multiply(frame, self.cockpit_mask, scale=1 / 255.0)
 
     # --------------------------------------------------------------- principal
-    def run(self) -> None:
+    def run(self) -> Optional[str]:
+        """Bucle principal. Devuelve el nombre del script a lanzar (o None si se cierra normalmente)."""
         cap = cv2.VideoCapture(CAMERA_INDEX)
         if not cap.isOpened():
             sys.exit(f"No se pudo abrir la cámara (índice {CAMERA_INDEX}). Cambia CAMERA_INDEX al inicio del archivo.")
@@ -1276,6 +1365,8 @@ class SpaceMuseum:
                 gesture = self.override or detector.stable
                 self.update(dt, gesture)
                 cv2.imshow(WINDOW_NAME, self.render(frame, dt, detector))
+                if self.next_script:                             # gesto L mantenido: salir para cambiar de programa
+                    break
 
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):
@@ -1290,19 +1381,33 @@ class SpaceMuseum:
                     self.override = GESTURE_OPEN
                 elif key == ord("f"):
                     self.override = GESTURE_FIST
+                elif key == ord("l"):
+                    self.override = GESTURE_L
                 elif key == ord("c"):
                     self.override = None
                 if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
                     break
         finally:
-            cap.release()
+            cap.release()                 # libera la cámara para que el otro script pueda usarla
             detector.close()
-            self.audio.close()
+            self.audio.close()            # cierra el mezclador de audio
             cv2.destroyAllWindows()
+            cv2.waitKey(1)
+        return self.next_script
+
+
+def launch_script(script: str, camera_index: int) -> None:
+    """Lanza otro script de Python (mismo intérprete, multiplataforma) como proceso independiente."""
+    time.sleep(0.4)   # margen para que el sistema libere del todo la cámara
+    subprocess.Popen([sys.executable, str(BASE_DIR / script), "--camera", str(camera_index)],
+                     cwd=str(BASE_DIR))
 
 
 def main() -> None:
-    SpaceMuseum().run()
+    next_script = SpaceMuseum().run()    # al volver, cámara, audio y ventanas ya están cerrados
+    if next_script:
+        launch_script(next_script, CAMERA_INDEX)
+    sys.exit()
 
 
 if __name__ == "__main__":
